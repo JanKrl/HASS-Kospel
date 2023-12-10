@@ -212,10 +212,12 @@ class Kospel(hass.Hass):
                 description = "standby"
             elif rgb_color == StateColors.RED:
                 description = "active"
+            elif rgb_color == StateColors.GRAY:
+                description = "on"
             elif rgb_color == StateColors.WHITE:
-                description = "inactive"
+                description = "off"
             elif rgb_color == StateColors.BLACK:
-                description = "enabled"
+                description = "unknown"
             else:
                 self.log(f"Unknown status color {item} => {rgb_color}")
                 description = "unknown"
@@ -243,6 +245,7 @@ class StateColors(str, Enum):
     GREEN = "rgb(0, 170, 0)"
     RED = "rgb(255, 0, 0)"
     WHITE = "rgb(233, 233, 233)"
+    GRAY = "rgb(133, 133, 133)"
     BLACK = "rgb(0, 0, 0)"
 
 
