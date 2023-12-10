@@ -1,0 +1,9 @@
+kospel:
+  module: kospel
+  class: Kospel
+  plugin: HASS
+  hass_namespace: hass
+  url: "https://ha.kospel.pl"
+  username: "<your-email>"
+  password: "<your-password"
+  exec_path: "/usr/bin/chromedriver"
