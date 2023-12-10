@@ -26,19 +26,19 @@ class Kospel(hass.Hass):
     SENSORS = {
         "temp_room": {
             "device_class": "temperature",
-            "friently_name": "Room temperature",
+            "friendly_name": "Room temperature",
             "unit_of_measurement": "°C",
             "icon": "mdi:thermometer",
         },
         "temp_outside": {
             "device_class": "temperature",
-            "friently_name": "Outside temperature",
+            "friendly_name": "Outside temperature",
             "unit_of_measurement": "°C",
             "icon": "mdi:thermometer",
         },
         "power": {
             "device_class": "power",
-            "friently_name": "Current power",
+            "friendly_name": "Current power",
             "unit_of_measurement": "kW",
             "icon": "mdi:lightning-bolt-outline",
         },
@@ -74,13 +74,13 @@ class Kospel(hass.Hass):
     SETTINGS = {
         "temp_prog": {
             "device_class": "temperature",
-            "friently_name": "Room temperature setting",
+            "friendly_name": "Room temperature setting",
             "unit_of_measurement": "°C",
             "icon": "mdi:thermometer",
         },
         "temp_zas_nas": {
             "device_class": "temperature",
-            "friently_name": "Tap water temperature setting",
+            "friendly_name": "Tap water temperature setting",
             "unit_of_measurement": "°C",
             "icon": "mdi:thermometer",
         },
@@ -209,7 +209,9 @@ class Kospel(hass.Hass):
                 continue
 
             if rgb_color == StateColors.GREEN:
-                description = "standy"
+                description = "standby"
+            elif rgb_color == StateColors.RED:
+                description = "active"
             elif rgb_color == StateColors.WHITE:
                 description = "inactive"
             elif rgb_color == StateColors.BLACK:
@@ -239,6 +241,7 @@ class StateColors(str, Enum):
     """Status colors used in UI"""
 
     GREEN = "rgb(0, 170, 0)"
+    RED = "rgb(255, 0, 0)"
     WHITE = "rgb(233, 233, 233)"
     BLACK = "rgb(0, 0, 0)"
 
