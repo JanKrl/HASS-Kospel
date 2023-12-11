@@ -416,7 +416,11 @@ class WebScrap:
         """Parameters table is loaded into DOM at the beginning
         But the values get populated only when it's opened by the user
         """
-        self.driver.find_element(By.ID, "parameters_lbl_").click()
+        try:
+            self.driver.find_element(By.ID, "parameters_lbl_").click()
+        except (ElementNotInteractableException,NoSuchElementException) as err:
+            raise ConnectionError("Error entering params page") from err
+            
         try:
             WebDriverWait(self.driver, timeout=10, poll_frequency=1).until(
                 EC.visibility_of_element_located((By.ID, "params_temp_in"))
