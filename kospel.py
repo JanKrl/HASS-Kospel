@@ -118,6 +118,10 @@ class Kospel(hass.Hass):
             self.log(e)
             self.addon_state("off")
             return
+        except Exception as e:
+            self.log(f"Uncaught exception {e}")
+            self.addon_state("off")
+            return
 
         self.log("Processing results")
         self.process_params(params)
@@ -148,8 +152,19 @@ class Kospel(hass.Hass):
             attributes=attributes_update,
         )
 
+    def reset(self):
+        """Sets all statuses to default state"""
+        for item in [*self.SENSORS, *self.STATUSES, *self.SETTINGS]:
+            self.sensor_state(item, "Unavailable")
+
     def addon_state(self, state):
         """Update state of the addon"""
+        if state == "off":
+            # Most probably there was some web scrap error
+            # Set this to go through entire login process again
+            self.web_scrap.logged_in = False
+            self.reset()
+
         self.set_state(f"{self.name}.state", state=state)
 
     def process_params(self, params):
@@ -418,9 +433,9 @@ class WebScrap:
         """
         try:
             self.driver.find_element(By.ID, "parameters_lbl_").click()
-        except (ElementNotInteractableException,NoSuchElementException) as err:
+        except (ElementNotInteractableException, NoSuchElementException) as err:
             raise ConnectionError("Error entering params page") from err
-            
+
         try:
             WebDriverWait(self.driver, timeout=10, poll_frequency=1).until(
                 EC.visibility_of_element_located((By.ID, "params_temp_in"))
