@@ -36,6 +36,12 @@ class Kospel(hass.Hass):
             "unit_of_measurement": "°C",
             "icon": "mdi:thermometer",
         },
+        "temp_boil": {
+            "device_class": "temperature",
+            "friendly_name": "Tap water temperature",
+            "unit_of_measurement": "°C",
+            "icon": "mdi:thermometer",
+        },
         "power": {
             "device_class": "power",
             "friendly_name": "Current power",
@@ -162,7 +168,7 @@ class Kospel(hass.Hass):
         if state == "off":
             # Most probably there was some web scrap error
             # Set this to go through entire login process again
-            self.web_scrap.logged_in = False
+            self.web_scrap.stop()
             self.reset()
 
         self.set_state(f"{self.name}.state", state=state)
@@ -317,8 +323,10 @@ class WebScrap:
 
     def stop(self):
         """Closes web driver"""
-        self.driver.close()
-        self.logged_in = False
+        try:
+            self.driver.close()
+        finally:
+            self.logged_in = False
 
     def run(self):
         """Collect data from web portal
