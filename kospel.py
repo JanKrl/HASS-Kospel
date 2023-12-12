@@ -123,10 +123,12 @@ class Kospel(hass.Hass):
         except ConnectionError as e:
             self.log(e)
             self.addon_state("off")
+            self.initialize()
             return
         except Exception as e:
-            self.log(f"Uncaught exception {e}")
+            self.log(f"Uncaught exception {e}. Re-initializing the plugin.")
             self.addon_state("off")
+            self.initialize()
             return
 
         self.log("Processing results")
