@@ -4,6 +4,7 @@ Integration with Kospel electric heaters
 from datetime import time
 from enum import Enum
 import re
+from threading import Lock
 from selenium import webdriver
 from selenium.common.exceptions import (
     NoSuchElementException,
@@ -92,7 +93,11 @@ class Kospel(hass.Hass):
     }
 
     def initialize(self):
+        """Runs once at start"""
         self.name = "kospel"
+        self.raw_status = None
+        self.raw_params = None
+
         self.web_scrap = WebScrap(
             self.args["url"],
             self.args["username"],
@@ -100,8 +105,6 @@ class Kospel(hass.Hass):
             self.args["exec_path"],
             self.log,
         )
-        self.raw_status = None
-        self.raw_params = None
 
         self.log("Initialized")
         self.run_minutely(self.read_data, time(0, 0, 31))
@@ -121,10 +124,12 @@ class Kospel(hass.Hass):
         except (ConnectionError, ReferenceError) as e:
             self.log(e)
             self.addon_state("off")
+            self.web_scrap.reset()
         except Exception as e:
-            self.log(f"Uncaught exception {e}. Quitting webdriver.")
+            # Something unexpected happened
+            self.log(f"Uncaught exception {e}.")
             self.addon_state("off")
-            self.web_scrap.stop()
+            self.web_scrap.reset()
         else:
             self.process_params(params)
             self.process_statuses(statuses)
@@ -135,19 +140,19 @@ class Kospel(hass.Hass):
         """Update a sensor"""
         sensor_name = f"sensor.{self.name}_{sensor}"
 
+        # TODO: Factory pattern here!
         if sensor in self.SENSORS:
-            attributes_update = self.SENSORS.get(sensor)
+            attributes_update = self.SENSORS.get(sensor, {})
         elif sensor in self.STATUSES:
-            attributes_update = self.STATUSES.get(sensor)
+            attributes_update = self.STATUSES.get(sensor, {})
         elif sensor in self.SETTINGS:
-            attributes_update = self.SETTINGS.get(sensor)
+            attributes_update = self.SETTINGS.get(sensor, {})
         else:
             attributes_update = {}
 
         if attributes:
             attributes_update.update(attributes)
 
-        # self.log(f"Updating sensor {sensor_name}: {value}")
         self.set_state(
             sensor_name,
             state=value,
@@ -166,15 +171,22 @@ class Kospel(hass.Hass):
             # Set this to go through entire login process again
             self.web_scrap.stop()
             self.reset()
+            color = StateColors.RED
+        else:
+            color = StateColors.GREEN
 
-        self.set_state(f"{self.name}.state", state=state)
+        self.set_state(
+            f"{self.name}.state",
+            state=state,
+            attributes={"rgb_color": self.get_rgb(color)},
+        )
 
     def process_params(self, params):
         """Processes raw data from web scraper
         Look for values expected according to sensor definition
 
         Args:
-            params (dict): Parameters values
+            params (dict): Parameters raw values
         """
         for item in self.SENSORS:
             # Look for the value
@@ -196,6 +208,12 @@ class Kospel(hass.Hass):
             self.sensor_state(item, value, attributes={"unit_of_measurement": unit})
 
     def process_settings(self, settings):
+        """Processes raw data from web scraper
+        Look for values expected according to settings definition
+
+        Args:
+            params (dict): Settings raw values
+        """
         for item in self.SETTINGS:
             readout = settings.get(item)
             if not readout:
@@ -266,7 +284,44 @@ class StateColors(str, Enum):
     BLACK = "rgb(0, 0, 0)"
 
 
-class WebScrap:
+class SingletonMeta(type):
+    """Source
+    https://refactoring.guru/design-patterns/singleton/python/example#example-1
+
+    Thread-safe singleton class
+    """
+
+    _instances = {}
+
+    _lock: Lock = Lock()
+    """
+    We now have a lock object that will be used to synchronize threads during
+    first access to the Singleton.
+    """
+
+    def __call__(cls, *args, **kwargs):
+        """
+        Possible changes to the value of the `__init__` argument do not affect
+        the returned instance.
+        """
+        # Now, imagine that the program has just been launched. Since there's no
+        # Singleton instance yet, multiple threads can simultaneously pass the
+        # previous conditional and reach this point almost at the same time. The
+        # first of them will acquire lock and will proceed further, while the
+        # rest will wait here.
+        with cls._lock:
+            # The first thread to acquire the lock, reaches this conditional,
+            # goes inside and creates the Singleton instance. Once it leaves the
+            # lock block, a thread that might have been waiting for the lock
+            # release may then enter this section. But since the Singleton field
+            # is already initialized, the thread won't create a new object.
+            if cls not in cls._instances:
+                instance = super().__call__(*args, **kwargs)
+                cls._instances[cls] = instance
+        return cls._instances[cls]
+
+
+class WebScrap(metaclass=SingletonMeta):
     """Scrapping data from Kospel Home Assistant module"""
 
     STATUS = [
@@ -303,6 +358,7 @@ class WebScrap:
         self.username = username
         self.password = password
         self.logged_in = False
+        self.exec_path = exec_path
 
         if log_function:
             self.log = log_function
@@ -310,7 +366,7 @@ class WebScrap:
             # empty function with one argument
             self.log = lambda x: None
 
-        self._build_driver(exec_path)
+        self._build_driver()
 
     def stop(self):
         """Closes web driver"""
@@ -318,6 +374,11 @@ class WebScrap:
             self.driver.quit()
         finally:
             self.logged_in = False
+
+    def reset(self):
+        """Re-initializes the webdriver"""
+        self.stop()
+        self._build_driver()
 
     def run(self):
         """Collect data from web portal
@@ -346,14 +407,14 @@ class WebScrap:
 
         return result_status, result_params, result_settings
 
-    def _build_driver(self, exec_path):
+    def _build_driver(self):
         chrome_options = Options()
         chrome_options.add_argument("--headless")
         chrome_options.add_argument("--no-sandbox")
         chrome_options.add_argument("--disable-gpu")
         chrome_options.add_argument("--disable-dev-shm-usage")
 
-        service = Service(executable_path=exec_path)
+        service = Service(executable_path=self.exec_path)
         self.driver = webdriver.Chrome(service=service, options=chrome_options)
 
     def _login_and_navigate(self):
@@ -473,7 +534,7 @@ class WebScrap:
 
         self._await_main_page()
 
-    def _wait_for_element(self, by, value, timeout=5):
+    def _wait_for_element(self, by, value, timeout=7):
         """Waits for an element to be available and gets its value"""
         try:
             element = WebDriverWait(
