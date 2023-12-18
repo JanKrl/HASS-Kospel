@@ -4,13 +4,13 @@ Integration with Kospel electric heaters
 from datetime import time
 from enum import Enum
 import re
+from threading import Lock
 from selenium import webdriver
 from selenium.common.exceptions import (
     NoSuchElementException,
     NoSuchAttributeException,
     TimeoutException,
     ElementNotInteractableException,
-    InvalidSessionIdException,
 )
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
@@ -93,15 +93,18 @@ class Kospel(hass.Hass):
     }
 
     def initialize(self):
+        """Runs once at start"""
         self.name = "kospel"
+        self.raw_status = None
+        self.raw_params = None
+
         self.web_scrap = WebScrap(
             self.args["url"],
             self.args["username"],
             self.args["password"],
             self.args["exec_path"],
+            self.log,
         )
-        self.raw_status = None
-        self.raw_params = None
 
         self.log("Initialized")
         self.run_minutely(self.read_data, time(0, 0, 31))
@@ -116,44 +119,40 @@ class Kospel(hass.Hass):
     def read_data(self, kwargs=None):
         """Fetch update from Kospel Panel"""
         self.log("Reading data")
-        if not self.web_scrap.logged_in:
-            self.log("Authenticating at web service")
         try:
             statuses, params, settings = self.web_scrap.run()
-        except ConnectionError as e:
+        except (ConnectionError, ReferenceError) as e:
             self.log(e)
             self.addon_state("off")
-            self.initialize()
-            return
+            self.web_scrap.reset()
         except Exception as e:
-            self.log(f"Uncaught exception {e}. Re-initializing the plugin.")
+            # Something unexpected happened
+            self.log(f"Uncaught exception {e}.")
             self.addon_state("off")
-            self.initialize()
-            return
-
-        self.log("Processing results")
-        self.process_params(params)
-        self.process_statuses(statuses)
-        self.process_settings(settings)
-        self.addon_state("on")
+            self.web_scrap.reset()
+        else:
+            self.process_params(params)
+            self.process_statuses(statuses)
+            self.process_settings(settings)
+            self.addon_state("on")
 
     def sensor_state(self, sensor, value, attributes=None):
         """Update a sensor"""
         sensor_name = f"sensor.{self.name}_{sensor}"
 
+        # TODO: Factory pattern here!
         if sensor in self.SENSORS:
-            attributes_update = self.SENSORS.get(sensor)
+            attributes_update = self.SENSORS.get(sensor, {})
         elif sensor in self.STATUSES:
-            attributes_update = self.STATUSES.get(sensor)
+            attributes_update = self.STATUSES.get(sensor, {})
         elif sensor in self.SETTINGS:
-            attributes_update = self.SETTINGS.get(sensor)
+            attributes_update = self.SETTINGS.get(sensor, {})
         else:
             attributes_update = {}
 
         if attributes:
             attributes_update.update(attributes)
 
-        self.log(f"Updating sensor {sensor_name}: {value}")
         self.set_state(
             sensor_name,
             state=value,
@@ -172,15 +171,22 @@ class Kospel(hass.Hass):
             # Set this to go through entire login process again
             self.web_scrap.stop()
             self.reset()
+            color = StateColors.RED
+        else:
+            color = StateColors.GREEN
 
-        self.set_state(f"{self.name}.state", state=state)
+        self.set_state(
+            f"{self.name}.state",
+            state=state,
+            attributes={"rgb_color": self.get_rgb(color)},
+        )
 
     def process_params(self, params):
         """Processes raw data from web scraper
         Look for values expected according to sensor definition
 
         Args:
-            params (dict): Parameters values
+            params (dict): Parameters raw values
         """
         for item in self.SENSORS:
             # Look for the value
@@ -202,6 +208,12 @@ class Kospel(hass.Hass):
             self.sensor_state(item, value, attributes={"unit_of_measurement": unit})
 
     def process_settings(self, settings):
+        """Processes raw data from web scraper
+        Look for values expected according to settings definition
+
+        Args:
+            params (dict): Settings raw values
+        """
         for item in self.SETTINGS:
             readout = settings.get(item)
             if not readout:
@@ -272,7 +284,44 @@ class StateColors(str, Enum):
     BLACK = "rgb(0, 0, 0)"
 
 
-class WebScrap:
+class SingletonMeta(type):
+    """Source
+    https://refactoring.guru/design-patterns/singleton/python/example#example-1
+
+    Thread-safe singleton class
+    """
+
+    _instances = {}
+
+    _lock: Lock = Lock()
+    """
+    We now have a lock object that will be used to synchronize threads during
+    first access to the Singleton.
+    """
+
+    def __call__(cls, *args, **kwargs):
+        """
+        Possible changes to the value of the `__init__` argument do not affect
+        the returned instance.
+        """
+        # Now, imagine that the program has just been launched. Since there's no
+        # Singleton instance yet, multiple threads can simultaneously pass the
+        # previous conditional and reach this point almost at the same time. The
+        # first of them will acquire lock and will proceed further, while the
+        # rest will wait here.
+        with cls._lock:
+            # The first thread to acquire the lock, reaches this conditional,
+            # goes inside and creates the Singleton instance. Once it leaves the
+            # lock block, a thread that might have been waiting for the lock
+            # release may then enter this section. But since the Singleton field
+            # is already initialized, the thread won't create a new object.
+            if cls not in cls._instances:
+                instance = super().__call__(*args, **kwargs)
+                cls._instances[cls] = instance
+        return cls._instances[cls]
+
+
+class WebScrap(metaclass=SingletonMeta):
     """Scrapping data from Kospel Home Assistant module"""
 
     STATUS = [
@@ -301,7 +350,7 @@ class WebScrap:
         "params_flow",  # Przeplyw
     ]
 
-    def __init__(self, url, username, password, exec_path):
+    def __init__(self, url, username, password, exec_path, log_function=None):
         """Initialize selenium driver with all required options
         Set which parameters should be read
         """
@@ -309,26 +358,27 @@ class WebScrap:
         self.username = username
         self.password = password
         self.logged_in = False
+        self.exec_path = exec_path
 
-        chrome_options = Options()
-        chrome_options.add_argument("--headless")
-        chrome_options.add_argument("--no-sandbox")
-        chrome_options.add_argument("--disable-gpu")
-        chrome_options.add_argument("--disable-dev-shm-usage")
-        # chrome_options.add_argument("--user-data-dir=chrome-data")
-        # chrome_options.add_argument("user-data-dir=chrome-data")
-        # chrome_options.add_experimental_option("detach", True)
+        if log_function:
+            self.log = log_function
+        else:
+            # empty function with one argument
+            self.log = lambda x: None
 
-        service = Service(executable_path=exec_path)
-
-        self.driver = webdriver.Chrome(service=service, options=chrome_options)
+        self._build_driver()
 
     def stop(self):
         """Closes web driver"""
         try:
-            self.driver.close()
+            self.driver.quit()
         finally:
             self.logged_in = False
+
+    def reset(self):
+        """Re-initializes the webdriver"""
+        self.stop()
+        self._build_driver()
 
     def run(self):
         """Collect data from web portal
@@ -336,14 +386,15 @@ class WebScrap:
         returns (dict, dict): dictionary with statuses and parameters
         """
         # Check if current page is already "main"
-        try:
-            self.driver.find_element(By.ID, "path7")
+        home_element = self._find_element(by=By.ID, value="path7")
+        if home_element:
             self.logged_in = True
-        except (ConnectionError, NoSuchElementException, InvalidSessionIdException):
+        else:
             self.logged_in = False
+            self._login_and_navigate()
 
         if not self.logged_in:
-            self._login_and_navigate()
+            raise PermissionError("Not logged in!")
 
         # Reading data
         result_status = self._read_status()
@@ -356,69 +407,79 @@ class WebScrap:
 
         return result_status, result_params, result_settings
 
+    def _build_driver(self):
+        chrome_options = Options()
+        chrome_options.add_argument("--headless")
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+
+        service = Service(executable_path=self.exec_path)
+        self.driver = webdriver.Chrome(service=service, options=chrome_options)
+
     def _login_and_navigate(self):
         """Navigates from login page to main apge"""
         self._login()
         self._goto_device()
         self._goto_module()
         self._await_main_page()
+        self.logged_in = True
 
     def _get_page(self, url):
         """Loads URL content and handles potential errors"""
         try:
             self.driver.get(url)
-        except Exception as err:
-            raise ConnectionError(f"Unable to reach URL: {url}") from err
-
-        return True
+        except Exception as error:
+            self.stop()
+            raise ConnectionError(f"Unable to reach URL: {url}") from error
 
     def _login(self):
         """Service login page"""
-        if not self._get_page(self.url):
-            return
+        self.log("Logging in")
+        # Read login page into the driver
+        self._get_page(self.url)
 
-        login = self._wait_for_element((By.ID, "login"))
-        password = self._wait_for_element((By.ID, "pass"))
+        login = self._wait_for_element(by=By.ID, value="login")
+        password = self._wait_for_element(by=By.ID, value="pass")
 
         login.send_keys(self.username)
         password.send_keys(self.password)
 
-        self.driver.find_element(By.LINK_TEXT, "zaloguj").click()
+        zaloguj = self._find_element(
+            by=By.LINK_TEXT, value="zaloguj", required=True, interactible=True
+        )
+        zaloguj.click()
 
     def _goto_device(self):
         """Select a device (after login)"""
-        self._wait_for_element((By.CLASS_NAME, "ui-body"))
+        self._wait_for_element(by=By.CLASS_NAME, value="ui-body")
 
         # Page contains list with available devices
         # I assume here that there is only one device
-        elements = self.driver.find_elements(By.TAG_NAME, "li")
-        if not elements:
-            self.logged_in = False
-            raise ConnectionError("Unable to select a device")
+        elements = self._find_elements(by=By.TAG_NAME, value="li", required=True)
         elements[0].click()
 
     def _goto_module(self):
         """Selects a module in the device.
         We're interested in management module
         """
-        self._wait_for_element((By.ID, "start"))
+        self._wait_for_element(by=By.ID, value="start")
         self.driver.execute_script(
             "loadModule('101','19');"
         )  # TODO check if this is OK
 
     def _await_main_page(self):
         # Path7 is "home image"
-        self._wait_for_element((By.ID, "path7"))
+        self._wait_for_element(by=By.ID, value="path7")
 
     def _read_status(self):
         """Status of services is encoded in icons' colors"""
         status = {}
         for icon in self.STATUS:
+            element = self._find_element(by=By.ID, value=f"{icon}_", required=True)
             try:
-                read = self.driver.find_element(
-                    By.ID, f"{icon}_"
-                ).value_of_css_property("fill")
-            except (NoSuchElementException, NoSuchAttributeException):
+                read = element.value_of_css_property("fill")
+            except NoSuchAttributeException:
                 read = "rgb(0, 0, 0)"
 
             status[icon] = read
@@ -428,12 +489,9 @@ class WebScrap:
     def _read_settings(self):
         settings = {}
         for setting in self.SETTINGS:
-            try:
-                read = self.driver.find_element(By.ID, setting).text
-            except NoSuchElementException:
-                continue
-
-            settings[setting] = read
+            element = self._find_element(by=By.ID, value=setting)
+            if element:
+                settings[setting] = element.text
 
         return settings
 
@@ -441,11 +499,12 @@ class WebScrap:
         """Parameters table is loaded into DOM at the beginning
         But the values get populated only when it's opened by the user
         """
-        try:
-            self.driver.find_element(By.ID, "parameters_lbl_").click()
-        except (ElementNotInteractableException, NoSuchElementException) as err:
-            raise ConnectionError("Error entering params page") from err
+        params_icon = self._find_element(
+            by=By.ID, value="parameters_lbl_", required=True, interactible=True
+        )
+        params_icon.click()
 
+        # Wait for values to be filled in
         try:
             WebDriverWait(self.driver, timeout=10, poll_frequency=1).until(
                 EC.visibility_of_element_located((By.ID, "params_temp_in"))
@@ -458,33 +517,74 @@ class WebScrap:
 
         params = {}
         for param in self.PARAMS:
-            try:
-                read = self.driver.find_element(By.ID, param).text
-            except NoSuchElementException:
-                read = "---"
-            params[param] = read
+            element = self._find_element(by=By.ID, value=param)
+            params[param] = element.text if element else "---"
 
         return params
 
     def _back_to_main(self):
         """Click on "back" button and go to main page"""
-        try:
-            self.driver.find_element(By.XPATH, '//*[@id="params"]/div[1]/a[2]').click()
-        except (ElementNotInteractableException, NoSuchElementException):
-            self.logged_in = False
+        back_button = self._find_element(
+            by=By.XPATH,
+            value='//*[@id="params"]/div[1]/a[2]',
+            required=True,
+            interactible=True,
+        )
+        back_button.click()
 
         self._await_main_page()
 
-    def _wait_for_element(self, locator, timeout=5):
+    def _wait_for_element(self, by, value, timeout=7):
         """Waits for an element to be available and gets its value"""
         try:
             element = WebDriverWait(
                 self.driver, timeout=timeout, poll_frequency=0.5
-            ).until(EC.presence_of_element_located(locator))
+            ).until(EC.presence_of_element_located((by, value)))
         except TimeoutException as err:
-            raise ConnectionError(f"Timeout on waiting for {locator}") from err
+            self.stop()
+            raise ReferenceError(f"Timeout on waiting for ({by, value})") from err
 
         return element
+
+    def _find_element(self, by, value, required=False, interactible=False):
+        """Gets element from the DOM
+
+        Args:
+            locator (tuple): Tuple of selenium selector type and it's value
+            required (bool, optional): Raise exception when not found.
+            Defaults to False.
+        """
+        try:
+            element = self.driver.find_element(by, value)
+        except NoSuchElementException as error:
+            element = None
+            if required:
+                self.stop()
+                raise ReferenceError(
+                    f"Required element {by, value} not found"
+                ) from error
+        except ElementNotInteractableException as error:
+            element = None
+            if interactible:
+                self.stop()
+                raise ReferenceError(f"Element {by, value} not interactible") from error
+        return element
+
+    def _find_elements(self, by, value, required=False):
+        try:
+            elements = self.driver.find_elements(by, value)
+        except NoSuchElementException as error:
+            elements = None
+            if required:
+                self.stop()
+                raise ReferenceError(
+                    f"Required elements {by, value} not found"
+                ) from error
+
+        if required and not elements:
+            self.stop()
+            raise ReferenceError(f"Required elements {by, value} not found")
+        return elements
 
 
 if __name__ == "__main__":
